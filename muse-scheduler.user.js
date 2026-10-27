@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Muse 定时发信（指定会话）
 // @namespace    https://github.com/pingmike2/muse-scheduler
-// @version      1.0.1
+// @version      1.0.2
 // @description  在 muse.ai 网页端按计划把文本消息自动发送到指定会话（/thread/xxx）。纯浏览器脚本，无后端依赖，只需保持一个已登录的标签页开着。
 // @author       pingmike2
 // @match        https://muse.ai/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.1';
+  const VERSION = '1.0.2';
   const STATE_KEY = 'm2a_sched_state_v1';
   const TABS_KEY = 'm2a_sched_tabs';
   const NAV_KEY = 'm2a_sched_nav';
@@ -496,99 +496,129 @@
     return !!t && !t.disabled && t.getAttribute('aria-disabled') !== 'true';
   }
 
-  async function clickSend(composer, beforeBtns) {
+  function composerScope(composer) {
+    try {
+      return composer.closest('form') || composer.closest('[data-testid*="composer" i]') || composer.parentElement;
+    } catch (_) {
+      return composer.parentElement;
+    }
+  }
+
+  function btnBad(btn) {
+    try { if (btn.querySelector('input[type="file"]')) return true; } catch (_) {}
+    return /attach|upload|file|image|photo|mic|voice|stop|model|tool|more|menu|设置|附件|图片|语音|停止|更多/i.test(sendLabel(btn));
+  }
+
+  function clickButton(btn) {
+    try { btn.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
+    try {
+      for (const type of ['mousedown', 'mouseup']) {
+        btn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window, button: 0 }));
+      }
+    } catch (_) {}
+    try { btn.click(); } catch (_) {}
+  }
+
+  function dismissPopup() {
+    try {
+      for (const type of ['keydown', 'keyup']) {
+        document.body.dispatchEvent(new KeyboardEvent(type, {
+          key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true,
+        }));
+      }
+    } catch (_) {}
+  }
+
+  function pressEnterKey(composer, mod) {
+    try { composer.focus(); } catch (_) {}
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      composer.dispatchEvent(new KeyboardEvent(type, Object.assign({
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
+      }, mod)));
+    }
+  }
+
+  function sendCandidates(composer, beforeBtns) {
+    const out = [];
+    const all = [...document.querySelectorAll('button,[role="button"]')].filter(isVisible);
+    const scope = composerScope(composer);
+    const inner = scope && scope.querySelectorAll
+      ? [...scope.querySelectorAll('button,[role="button"]')].filter(isVisible)
+      : [];
+    const exactRe = /^(send|send message|send now|发送|发送消息)$/i;
+    const labelOf = b => (b.getAttribute('aria-label') || b.getAttribute('title') || '').trim();
+    const exact = b => exactRe.test(labelOf(b));
+    const loose = b => /send|发送/i.test(sendLabel(b));
+    const usable = b => !b.disabled && b.getAttribute('aria-disabled') !== 'true' && !btnBad(b);
+    const push = (tag, el) => { if (el) out.push({ tag, el }); };
+
+    push('框内发送', inner.find(b => usable(b) && exact(b)) || inner.find(b => usable(b) && loose(b)));
+
+    if (beforeBtns) {
+      const fresh = all.filter(b => !beforeBtns.has(b) && usable(b));
+      push('新按钮', fresh.find(exact) || fresh.find(loose) || (fresh.length === 1 ? fresh[0] : null));
+    }
+
     const cRect = composer.getBoundingClientRect();
-    const dist = el => {
+    const gap = el => {
       const r = el.getBoundingClientRect();
-      return Math.abs((r.left + r.width / 2) - (cRect.right - 16)) +
-        Math.abs((r.top + r.height / 2) - (cRect.top + cRect.height / 2));
+      const dx = Math.max(0, cRect.left - r.right, r.left - cRect.right);
+      const dy = Math.max(0, cRect.top - r.bottom, r.top - cRect.bottom);
+      return Math.sqrt(dx * dx + dy * dy);
     };
-    const bad = b => /attach|upload|file|image|photo|mic|voice|stop|model|tool|设置|附件|图片|语音|停止/i.test(sendLabel(b));
-    const deadline = now() + 3000;
-    let disabledLabel = '';
-    while (now() < deadline) {
-      if (beforeBtns) {
-        const fresh = [...document.querySelectorAll('button,[role="button"]')]
-          .filter(b => !beforeBtns.has(b) && isVisible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true' && !bad(b));
-        const sendFresh = fresh.find(b => /send|发送/i.test(sendLabel(b)));
-        const t = sendFresh || (fresh.length === 1 ? fresh[0] : null);
-        if (t) {
-          t.click();
-          return { how: 'button', label: '新出现按钮:' + (sendLabel(t).trim().slice(0, 30) || t.tagName.toLowerCase()) };
-        }
-      }
-      const btns = [...document.querySelectorAll('button,[role="button"]')]
-        .filter(isVisible)
-        .sort((a, b) => dist(a) - dist(b));
-      const exact = btns.find(b => /^(send|send message|发送|发送消息)$/i.test(
-        (b.getAttribute('aria-label') || b.getAttribute('title') || '').trim()
-      ));
-      const near = btns.filter(b => dist(b) < 300);
-      const loose = near.find(b => /send|发送/i.test(sendLabel(b)));
-      const target = exact || loose;
-      if (target) {
-        const off = !!target.disabled || target.getAttribute('aria-disabled') === 'true';
-        if (off) {
-          disabledLabel = sendLabel(target).trim().slice(0, 40);
-        } else {
-          target.click();
-          return { how: 'button', label: sendLabel(target).trim().slice(0, 40) || target.tagName.toLowerCase() };
-        }
-      }
-      await sleep(120);
-    }
-    const scope = (() => {
-      try {
-        return composer.closest('[data-testid*="composer" i]') || composer.closest('form') || composer.parentElement;
-      } catch (_) { return composer.parentElement; }
-    })();
-    if (scope && scope.querySelectorAll) {
-      const inner = [...scope.querySelectorAll('button,[role="button"]')]
-        .filter(b => isVisible(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true')
-        .filter(b => !/attach|upload|file|image|photo|mic|voice|stop|model|tool|设置|附件|图片|语音|停止/i.test(sendLabel(b)));
-      const last = inner[inner.length - 1];
-      if (last) {
-        last.click();
-        return { how: 'button', label: '输入框旁按钮:' + (sendLabel(last).trim().slice(0, 30) || last.tagName.toLowerCase()) };
-      }
-    }
+    const nearby = all.filter(usable).sort((a, b) => gap(a) - gap(b));
+    push('附近发送',
+      nearby.find(b => gap(b) < 400 && exact(b)) || nearby.find(b => gap(b) < 400 && loose(b)));
 
     const cy = cRect.top + cRect.height / 2;
-    const nearRow = [...document.querySelectorAll('button,[role="button"]')].filter(b => {
-      if (!isVisible(b) || b.disabled || b.getAttribute('aria-disabled') === 'true' || bad(b)) return false;
+    const row = all.filter(usable).filter(b => {
       const r = b.getBoundingClientRect();
-      return Math.abs((r.top + r.height / 2) - cy) < 90 && r.left > cRect.left - 40;
-    });
-    nearRow.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-    if (nearRow[0]) {
-      const t = nearRow[0];
-      t.click();
-      return { how: 'button', label: '输入框右侧按钮:' + (sendLabel(t).trim().slice(0, 30) || t.tagName.toLowerCase()) };
-    }
+      return Math.abs((r.top + r.height / 2) - cy) < Math.max(60, Math.min(150, cRect.height)) &&
+        r.left > cRect.left - 60;
+    }).sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+    push('同一行最右', row[0]);
 
-    composer.focus();
-    const pressEnter = mod => {
-      for (const type of ['keydown', 'keypress', 'keyup']) {
-        composer.dispatchEvent(new KeyboardEvent(type, Object.assign({
-          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true,
-        }, mod)));
-      }
+    const last = inner.filter(usable).slice(-1)[0];
+    push('框内最后一个', last);
+
+    const seen = new Set();
+    return out.filter(c => {
+      if (!c.el || seen.has(c.el)) return false;
+      seen.add(c.el);
+      return true;
+    });
+  }
+
+  async function attemptSend(composer, text, beforeBtns, ok) {
+    const tried = [];
+    const keepText = () => {
+      const cur = composerText(composer).trim();
+      if (cur && cur !== text.trim()) fillComposer(composer, text);
     };
-    pressEnter({ ctrlKey: true });
-    await sleep(600);
-    if (!composerText(composer).trim()) return { how: 'enter', label: 'Ctrl+Enter' };
-    pressEnter({});
-    let label = '';
-    if (disabledLabel) {
-      label = '按钮被禁用：' + disabledLabel;
-    } else {
-      try {
-        const all = [...document.querySelectorAll('button,[role="button"]')].filter(isVisible);
-        const sendish = all.filter(b => /send|发送/i.test(sendLabel(b))).length;
-        label = `未识别到发送按钮（可见按钮 ${all.length} 个，含 send 字样 ${sendish} 个，输入框 ${composer.tagName.toLowerCase()}）`;
-      } catch (_) {}
+    for (const c of sendCandidates(composer, beforeBtns)) {
+      if (ok()) return { ok: true, how: '页面已确认', tried };
+      const label = (sendLabel(c.el).trim().replace(/\s+/g, ' ').slice(0, 32)) || c.el.tagName.toLowerCase();
+      clickButton(c.el);
+      tried.push(c.tag + ':' + label);
+      addLog('尝试发送（' + c.tag + '）：' + label, 'info');
+      await sleep(500);
+      scrollChatToBottom();
+      if (await waitFor(ok, 2500, 200)) return { ok: true, how: c.tag + '：' + label, tried };
+      dismissPopup();
+      keepText();
     }
-    return { how: 'enter', label };
+    for (const pair of [['Ctrl+Enter', { ctrlKey: true }], ['Enter', {}]]) {
+      if (ok()) return { ok: true, how: '页面已确认', tried };
+      pressEnterKey(composer, pair[1]);
+      tried.push(pair[0]);
+      addLog('尝试发送：' + pair[0], 'info');
+      await sleep(600);
+      scrollChatToBottom();
+      if (await waitFor(ok, 2500, 200)) return { ok: true, how: pair[0], tried };
+      dismissPopup();
+      keepText();
+    }
+    return { ok: false, how: '', tried };
   }
 
   async function performSend(task) {
@@ -630,10 +660,6 @@
       await sleep(250);
       if (!composerText(composer).trim()) fillComposer(composer, task.text);
     }
-    const how = await clickSend(composer, beforeBtns);
-    addLog(`已触发发送（${how.how === 'button' ? '按钮：' + how.label : '回车兜底' + (how.label ? '（' + how.label + '）' : '')}），等待页面确认…`, 'info');
-    await sleep(300);
-    scrollChatToBottom();
 
     const needle = task.text.trim().slice(0, 40);
     const baseCount = userBubbleCount();
@@ -644,20 +670,19 @@
       const last = lastUserBubbleText();
       return !!needle && last !== baseLast && last.includes(needle);
     };
-    const ok = () => newBubble() || isGenerating() || !composerText(composer).trim();
+    const confirmed = () => newBubble() || isGenerating() || !composerText(composer).trim();
 
-    let confirmed = await waitFor(ok, 6000, 300);
-    if (!confirmed && stillMine()) {
-      addLog('第一次点击未生效，再试一次…', 'warn');
-      await clickSend(composer);
-      await sleep(300);
+    const res = await attemptSend(composer, task.text, beforeBtns, confirmed);
+    if (res.ok) {
+      addLog('已发送（' + res.how + '）', 'ok');
+    } else {
       scrollChatToBottom();
-      confirmed = await waitFor(ok, 14000, 300);
-    }
-    if (!confirmed) {
-      throw new Error(
-        `未能确认发送成功（${how.how === 'button' ? '点了按钮' : '没找到可用发送按钮，只试了回车'}；输入框内容仍在，且未检测到新消息）`
-      );
+      if (!(await waitFor(confirmed, 3000, 300))) {
+        throw new Error(
+          '未能确认发送成功（试过 ' + res.tried.length + ' 种方式：' + res.tried.slice(-3).join(' / ') +
+          '；输入框内容仍在，且未检测到新消息）'
+        );
+      }
     }
     if (stillMine() && (newBubble() || isGenerating())) fillComposer(composer, '');
   }
