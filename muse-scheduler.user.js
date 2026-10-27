@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         Muse 定时发信（指定会话）
 // @namespace    https://github.com/pingmike2/muse-scheduler
-// @version      1.0.3
+// @version      1.0.4
 // @description  在 muse.ai 网页端按计划把文本消息自动发送到指定会话（/thread/xxx）。纯浏览器脚本，无后端依赖，只需保持一个已登录的标签页开着。
 // @author       pingmike2
 // @match        https://muse.ai/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.3';
+  const VERSION = '1.0.4';
   const STATE_KEY = 'm2a_sched_state_v1';
   const TABS_KEY = 'm2a_sched_tabs';
   const NAV_KEY = 'm2a_sched_nav';
@@ -357,6 +357,30 @@
     });
   }
 
+  async function waitIdle(maxMs, stallMs) {
+    const t0 = now();
+    const sig = () => {
+      const nodes = document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"],div[class*="hatch-agent-bubble"]');
+      if (!nodes.length) return '0';
+      const last = nodes[nodes.length - 1];
+      return nodes.length + ':' + (last.textContent || '').length;
+    };
+    let lastSig = sig();
+    let lastChange = now();
+    while (now() - t0 < maxMs) {
+      if (!isGenerating()) return { idle: true, stalled: false };
+      const cur = sig();
+      if (cur !== lastSig) {
+        lastSig = cur;
+        lastChange = now();
+      } else if (now() - lastChange >= stallMs) {
+        return { idle: false, stalled: true };
+      }
+      await sleep(2000);
+    }
+    return { idle: false, stalled: false };
+  }
+
   /* ---------------- 页面操作 ---------------- */
 
   function findComposer() {
@@ -401,11 +425,32 @@
     return !!((t && t.value.trim()) || (x && x.value.trim()));
   }
 
+  function onScreen(el, pad) {
+    try {
+      const r = el.getBoundingClientRect();
+      const p = pad || 0;
+      return r.width > 0 && r.height > 0 &&
+        r.bottom > -p && r.right > -p &&
+        r.top < window.innerHeight + p && r.left < window.innerWidth + p;
+    } catch (_) { return false; }
+  }
+
   function isGenerating() {
-    const btns = [...document.querySelectorAll('button,[role="button"]')].filter(isVisible);
-    return btns.some(b => /stop|停止/i.test(
-      (b.getAttribute('aria-label') || '') + (b.getAttribute('data-testid') || '') + (b.innerText || '')
-    ));
+    let scope = null;
+    try {
+      const c = findComposer();
+      if (c) scope = composerScope(c);
+    } catch (_) {}
+    const hit = [...document.querySelectorAll('button,[role="button"]')].some(b => {
+      const raw = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '') + ' ' + (b.innerText || '');
+      if (!/stop|停止/i.test(raw)) return false;
+      if (!onScreen(b)) return false;
+      if (scope && scope.contains(b)) return true;
+      return /^(hatch-composer-stop-button|stop|stop generating|停止|停止生成)$/i.test(
+        (b.getAttribute('data-testid') || b.getAttribute('aria-label') || '').trim()
+      );
+    });
+    return hit;
   }
 
   function scrollChatToBottom() {
@@ -650,8 +695,9 @@
       throw new Error('输入框已有未发送内容，已跳过以免覆盖草稿');
     }
 
-    const idle = await waitFor(() => !isGenerating(), 180000);
-    if (!idle) throw new Error('会话一直在生成中，本次跳过（5 分钟后重试）');
+    const w = await waitIdle(180000, 150000);
+    if (!w.idle && !w.stalled) throw new Error('会话一直在生成中，本次跳过（5 分钟后重试）');
+    if (w.stalled) addLog('生成状态长时间无变化，按卡住处理，继续发送', 'warn');
 
     const beforeBtns = new Set([...document.querySelectorAll('button,[role="button"]')]);
     try {
@@ -687,7 +733,8 @@
       const last = lastUserBubbleText();
       return !!needle && last !== baseLast && last.includes(needle);
     };
-    const confirmed = () => newBubble() || isGenerating() || !composerText(composer).trim();
+    const wasGenerating = isGenerating();
+    const confirmed = () => newBubble() || (isGenerating() && !wasGenerating) || !composerText(composer).trim();
 
     const res = await attemptSend(composer, task.text, beforeBtns, confirmed);
     if (res.ok) {
@@ -707,7 +754,7 @@
         );
       }
     }
-    if (stillMine() && (newBubble() || isGenerating())) fillComposer(composer, '');
+    if (stillMine() && (newBubble() || (isGenerating() && !wasGenerating))) fillComposer(composer, '');
   }
 
   /* ---------------- 跨标签页协调 ---------------- */
@@ -1522,10 +1569,29 @@
     }
     const cRect = cur ? cur.getBoundingClientRect() : null;
     const btns = [...document.querySelectorAll('button,[role="button"]')].filter(vis);
+    lines.push('生成中: ' + isGenerating() + '（视口 ' + window.innerWidth + 'x' + window.innerHeight + '）');
+    const stops = btns.filter(b => /stop|停止/i.test(
+      (b.getAttribute('aria-label') || '') + (b.getAttribute('data-testid') || '') + (b.innerText || '')
+    ));
+    stops.forEach(b => {
+      const r = b.getBoundingClientRect();
+      lines.push(`  stop候选 tid=${b.getAttribute('data-testid') || ''} aria=${JSON.stringify(b.getAttribute('aria-label') || '')} onScreen=${onScreen(b)} rect=${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}x${Math.round(r.height)}`);
+    });
+    const nearOf = b => {
+      if (!cRect) return false;
+      const r = b.getBoundingClientRect();
+      return Math.abs((r.top + r.height / 2) - (cRect.top + cRect.height / 2)) < 90;
+    };
+    btns.sort((a, b) => {
+      const na = nearOf(a) ? 0 : 1;
+      const nb = nearOf(b) ? 0 : 1;
+      if (na !== nb) return na - nb;
+      return Math.abs(a.getBoundingClientRect().top) - Math.abs(b.getBoundingClientRect().top);
+    });
     lines.push('按钮(可见): ' + btns.length);
     btns.slice(0, 40).forEach((b, i) => {
       const r = b.getBoundingClientRect();
-      const near = cRect ? Math.abs((r.top + r.height / 2) - (cRect.top + cRect.height / 2)) < 90 : false;
+      const near = nearOf(b);
       lines.push(`  [${i}] tid=${b.getAttribute('data-testid') || ''} aria=${JSON.stringify(b.getAttribute('aria-label') || '')} title=${JSON.stringify(b.getAttribute('title') || '')} text=${JSON.stringify((b.innerText || '').trim().slice(0, 20))} dis=${b.disabled} near=${near} rect=${Math.round(r.left)},${Math.round(r.top)},${Math.round(r.width)}x${Math.round(r.height)}`);
     });
     return lines.join('\n');
