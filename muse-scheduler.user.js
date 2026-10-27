@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         Muse 定时发信（指定会话）
 // @namespace    https://github.com/pingmike2/muse-scheduler
-// @version      1.0.0
-// @description  在 muse.ai 上按计划把文本消息定时发送到指定会话（/thread/xxx）。muse2api 的对话接口是无状态的，只有网页端才能真正发进已有会话。
+// @version      1.0.1
+// @description  在 muse.ai 网页端按计划把文本消息自动发送到指定会话（/thread/xxx）。纯浏览器脚本，无后端依赖，只需保持一个已登录的标签页开着。
 // @author       pingmike2
 // @match        https://muse.ai/*
 // @match        https://*.muse.ai/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.1';
   const STATE_KEY = 'm2a_sched_state_v1';
   const TABS_KEY = 'm2a_sched_tabs';
   const NAV_KEY = 'm2a_sched_nav';
