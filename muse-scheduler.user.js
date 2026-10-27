@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Muse 定时发信（指定会话）
 // @namespace    https://github.com/pingmike2/muse-scheduler
-// @version      1.0.2
+// @version      1.0.3
 // @description  在 muse.ai 网页端按计划把文本消息自动发送到指定会话（/thread/xxx）。纯浏览器脚本，无后端依赖，只需保持一个已登录的标签页开着。
 // @author       pingmike2
 // @match        https://muse.ai/*
@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.2';
+  const VERSION = '1.0.3';
   const STATE_KEY = 'm2a_sched_state_v1';
   const TABS_KEY = 'm2a_sched_tabs';
   const NAV_KEY = 'm2a_sched_nav';
@@ -478,6 +478,12 @@
       (btn.innerText || '');
   }
 
+  function btnKey(btn) {
+    const part = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+    return ['btn', btn.tagName.toLowerCase(), btn.getAttribute('data-testid') || '',
+      btn.getAttribute('aria-label') || '', btn.getAttribute('title') || '', part(btn.innerText)].join('|');
+  }
+
   function hasReadySend(composer) {
     const cRect = composer.getBoundingClientRect();
     const dist = el => {
@@ -591,11 +597,17 @@
 
   async function attemptSend(composer, text, beforeBtns, ok) {
     const tried = [];
+    const pref = readState().settings.sendPref || '';
     const keepText = () => {
       const cur = composerText(composer).trim();
       if (cur && cur !== text.trim()) fillComposer(composer, text);
     };
-    for (const c of sendCandidates(composer, beforeBtns)) {
+    const cands = sendCandidates(composer, beforeBtns);
+    if (pref.indexOf('btn|') === 0) {
+      const i = cands.findIndex(c => btnKey(c.el) === pref);
+      if (i > 0) cands.unshift(cands.splice(i, 1)[0]);
+    }
+    for (const c of cands) {
       if (ok()) return { ok: true, how: '页面已确认', tried };
       const label = (sendLabel(c.el).trim().replace(/\s+/g, ' ').slice(0, 32)) || c.el.tagName.toLowerCase();
       clickButton(c.el);
@@ -603,18 +615,23 @@
       addLog('尝试发送（' + c.tag + '）：' + label, 'info');
       await sleep(500);
       scrollChatToBottom();
-      if (await waitFor(ok, 2500, 200)) return { ok: true, how: c.tag + '：' + label, tried };
+      if (await waitFor(ok, 2500, 200)) return { ok: true, how: c.tag + '：' + label, tried, el: c.el };
       dismissPopup();
       keepText();
     }
-    for (const pair of [['Ctrl+Enter', { ctrlKey: true }], ['Enter', {}]]) {
+    const keys = [['Ctrl+Enter', { ctrlKey: true }], ['Enter', {}]];
+    if (pref.indexOf('enter|') === 0) {
+      const i = keys.findIndex(k => k[0] === pref.slice(6));
+      if (i > 0) keys.unshift(keys.splice(i, 1)[0]);
+    }
+    for (const pair of keys) {
       if (ok()) return { ok: true, how: '页面已确认', tried };
       pressEnterKey(composer, pair[1]);
       tried.push(pair[0]);
       addLog('尝试发送：' + pair[0], 'info');
       await sleep(600);
       scrollChatToBottom();
-      if (await waitFor(ok, 2500, 200)) return { ok: true, how: pair[0], tried };
+      if (await waitFor(ok, 2500, 200)) return { ok: true, how: pair[0], tried, key: pair[0] };
       dismissPopup();
       keepText();
     }
@@ -675,6 +692,12 @@
     const res = await attemptSend(composer, task.text, beforeBtns, confirmed);
     if (res.ok) {
       addLog('已发送（' + res.how + '）', 'ok');
+      try {
+        const st = readState();
+        if (res.el) st.settings.sendPref = btnKey(res.el);
+        else if (res.key) st.settings.sendPref = 'enter|' + res.key;
+        writeState(st);
+      } catch (_) {}
     } else {
       scrollChatToBottom();
       if (!(await waitFor(confirmed, 3000, 300))) {
@@ -1480,6 +1503,7 @@
     const lines = [];
     const vis = el => isVisible(el);
     lines.push('URL: ' + location.href);
+    lines.push('记忆:' + (readState().settings.sendPref || '无'));
     const all = [...document.querySelectorAll('textarea,[contenteditable="true"],[role="textbox"]')].filter(vis);
     lines.push('编辑区(可见): ' + all.length);
     all.forEach((el, i) => {
@@ -1513,6 +1537,12 @@
     GM_registerMenuCommand('⏰ 打开发信面板', togglePanel);
     GM_registerMenuCommand('▶ 立即检查一次任务', () => tick());
     GM_registerMenuCommand('🧹 复位发送状态（清除卡住的锁）', resetRuntime);
+    GM_registerMenuCommand('🧽 清除发送方式记忆', () => {
+      const st = readState();
+      delete st.settings.sendPref;
+      writeState(st);
+      toast('已清除发送方式记忆', 'ok');
+    });
     GM_registerMenuCommand('🧪 复制发送诊断信息', () => {
       const text = sendDiagnostics();
       console.log('[muse-sched] 发送诊断\n' + text);
